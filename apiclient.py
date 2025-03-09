@@ -16,7 +16,7 @@ class ApiClient:
         self.config = config
         self.session = requests.Session()  # 使用持久会话
         self.session.headers.update({'Connection': 'keep-alive'})
-
+        
     def _generate_digest(self, content=''):
         """生成内容摘要"""
         if content:
@@ -43,8 +43,10 @@ class ApiClient:
         headers = {
             'accept': 'text/event-stream, text/event-stream' if is_chat else 'application/json, text/plain, */*',
             'accept-language': 'zh-CN,zh;q=0.9',
-            'content-type': 'application/json',
+            'cache-control': 'no-cache',
+            'content-type': 'application/json; charset=utf-8',  # 确保UTF-8编码
             'origin': 'https://www.wenxiaobai.com',
+            'pragma': 'no-cache',
             'priority': 'u=1, i',
             'referer': 'https://www.wenxiaobai.com/',
             'sec-ch-ua': '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
@@ -78,45 +80,115 @@ class ApiClient:
           
         return headers
 
-    def post(self, url, data):
+    def post(self, url, data=None):
         """发送POST请求"""
         try:
-            # 如果是完整URL，直接使用；否则拼接base_url
-            full_url = url if url.startswith('http') else f"{self.base_url}{url}"
+            # 确保数据使用UTF-8编码
+            json_data = json.dumps(data, ensure_ascii=False).encode('utf-8') if data else None
+            json_str = json.dumps(data, ensure_ascii=False) if data else ''
             
-            # 将数据转换为JSON字符串
-            content = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+            # 获取头部，包含认证信息
+            headers = self.get_headers(json_str)
             
-            # 获取请求头
-            headers = self.get_headers(content)
-            
-            # 发送请求
-            response = requests.post(full_url, data=content, headers=headers)
+            response = self.session.post(
+                url, 
+                data=json_data,
+                headers=headers,
+                timeout=30
+            )
             
             if response.status_code == 200:
                 return response.json()
             else:
-                logger.error(f"[WenXiaoBai] POST请求失败 [{url}]: HTTP {response.status_code}")
-                return None
+                logger.error(f"API请求失败: {response.status_code} - {response.text}")
+                return {"code": response.status_code, "msg": response.text}
+        except UnicodeEncodeError as e:
+            logger.error(f"编码错误: {e}")
+            # 尝试降级处理
+            try:
+                # 使用ASCII编码但保留可打印字符
+                data_str = json.dumps(data, ensure_ascii=True)
+                # 获取头部
+                headers = self.get_headers(data_str)
+                response = self.session.post(url, data=data_str.encode('utf-8'), headers=headers, timeout=30)
+                return response.json() if response.status_code == 200 else {"code": response.status_code, "msg": response.text}
+            except Exception as fallback_e:
+                logger.error(f"降级处理失败: {fallback_e}")
+                return {"code": -1, "msg": f"请求编码错误: {str(e)}"}
         except Exception as e:
-            logger.error(f"[WenXiaoBai] POST请求失败 [{url}]: {str(e)}")
-            return None
+            logger.error(f"API请求异常: {str(e)}")
+            return {"code": -1, "msg": str(e)}
 
-    def stream_post(self, url, data, is_chat=False):
+    def stream_post(self, url, data=None, is_chat=False):
         """发送流式POST请求"""
         try:
-            content = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-            headers = self.get_headers(content, is_chat)
-            return self.session.post(url, headers=headers, data=content, stream=True)
+            # 确保数据使用UTF-8编码
+            json_data = json.dumps(data, ensure_ascii=False).encode('utf-8') if data else None
+            json_str = json.dumps(data, ensure_ascii=False) if data else ''
+            
+            # 获取包含认证信息的头部
+            headers = self.get_headers(json_str, is_chat)
+            
+            # 先发送心跳请求
+            self._send_heartbeat()
+            
+            # 发送事件追踪
+            if is_chat and data and 'query' in data:
+                self._send_tracking_event(data['query'])
+            
+            response = self.session.post(
+                url, 
+                data=json_data,
+                headers=headers,
+                stream=True,
+                timeout=120  # 增加超时时间
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"流式API请求失败: {response.status_code} - {response.text}")
+                
+            return response
+            
+        except UnicodeEncodeError as e:
+            logger.error(f"流式请求编码错误: {e}")
+            # 尝试降级处理
+            try:
+                # 使用ASCII编码但保留可打印字符
+                data_str = json.dumps(data, ensure_ascii=True)
+                headers = self.get_headers(data_str, is_chat)
+                return self.session.post(url, data=data_str.encode('utf-8'), headers=headers, stream=True, timeout=120)
+            except Exception as fallback_e:
+                logger.error(f"流式请求降级处理失败: {fallback_e}")
+                return None
         except Exception as e:
-            logger.error(f"[WenXiaoBai] 流式POST失败 [{url}]: {str(e)}")
+            logger.error(f"流式API请求异常: {str(e)}")
             return None
 
     def _send_heartbeat(self):
         """发送心跳包"""
         try:
             url = f'{self.base_url}/api/v1.0/user/time/heartbeat'
-            headers = self.get_headers()
+            headers = {
+                'accept': '*/*',
+                'accept-language': 'zh-CN,zh;q=0.9',
+                'content-length': '0',
+                'origin': 'https://www.wenxiaobai.com',
+                'priority': 'u=1, i',
+                'referer': 'https://www.wenxiaobai.com/',
+                'sec-ch-ua': '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-site',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+            }
+            
+            if token := self.config.get('token'):
+                headers['x-yuanshi-authorization'] = f"Bearer {token}"
+            if device_id := self.config.get('device_id'):
+                headers['x-yuanshi-deviceid'] = device_id
+                
             response = self.session.post(url, headers=headers)
             return response.status_code == 200
         except Exception as e:
@@ -130,27 +202,45 @@ class ApiClient:
             turn_id = f"newTurnId_{int(time.time() * 1000)}"
             event_index = int(time.time() * 1000) - 15000
             session_id = str(uuid.uuid4())
-        
+            
             data = [{
                 "events": [
                     {
                         "event": "chat_sse_event",
                         "params": json.dumps({
-                            "conversation_id": self.config['conversation_id'],
+                            "conversation_id": self.config.get('conversation_id', ''),
                             "turn_id": turn_id,
                             "content": message,
                             "sse_event": "begin",
                             "refer_page": "history",
-                            "user_id": self.config['user_id'],
+                            "user_id": self.config.get('user_id', ''),
                             "bot_id": "200006",
                             "event_index": event_index + 1
                         }),
                         "local_time_ms": int(time.time() * 1000),
                         "session_id": session_id
+                    },
+                    {
+                        "event": "chat_input_new_start_btn_click",
+                        "params": json.dumps({
+                            "page": "chat",
+                            "area": "input",
+                            "element": "new_start_btn",
+                            "bhv_type": "click",
+                            "is_new_start": 1,
+                            "conversation_id": self.config.get('conversation_id', ''),
+                            "is_active_new_start": 1,
+                            "refer_page": "history",
+                            "user_id": self.config.get('user_id', ''),
+                            "bot_id": "200006",
+                            "event_index": event_index
+                        }),
+                        "local_time_ms": int(time.time() * 1000) - 100,
+                        "session_id": session_id
                     }
                 ],
                 "user": {
-                    "user_unique_id": self.config['user_id'],
+                    "user_unique_id": self.config.get('user_id', ''),
                     "web_id": self.config.get('web_id', '')
                 },
                 "header": {
@@ -158,20 +248,44 @@ class ApiClient:
                     "os_name": "windows",
                     "os_version": "10",
                     "device_model": "Windows NT 10.0",
+                    "language": "zh-CN",
                     "platform": "web",
+                    "sdk_version": "5.1.9_feature_2",
+                    "sdk_lib": "js",
+                    "timezone": 8,
+                    "tz_offset": -28800,
+                    "resolution": "1280x720",
                     "browser": "Chrome",
-                    "browser_version": "129.0.0.0"
-                }
+                    "browser_version": "129.0.0.0",
+                    "referrer": "https://www.wenxiaobai.com/chat/tourist",
+                    "referrer_host": "www.wenxiaobai.com",
+                    "width": 1280,
+                    "height": 720,
+                    "screen_width": 1280,
+                    "screen_height": 720,
+                    "tracer_data": "{\"$utm_from_url\":1}",
+                    "custom": "{}"
+                },
+                "local_time": int(time.time()),
+                "verbose": 1
             }]
-        
+            
             headers = {
                 'Accept': '*/*',
-                'Content-Type': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Connection': 'keep-alive',
+                'Content-Type': 'application/json; charset=UTF-8',
                 'Origin': 'https://www.wenxiaobai.com',
                 'Referer': 'https://www.wenxiaobai.com/',
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'cross-site',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+                'sec-ch-ua': '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"'
             }
-        
+            
             response = requests.post(url, headers=headers, json=data)
             return response.status_code == 200
         except Exception as e:

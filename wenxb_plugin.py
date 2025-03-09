@@ -53,6 +53,19 @@ class WenXiaoBaiPlugin(Plugin):
             self.waiting_for_image = {}  # 用户等待图片状态
             self.image_queries = {}  # 存储用户的识图问题
             
+            # 如果没有触发词配置，添加默认值
+            if 'trigger_words' not in self.config:
+                self.config['trigger_words'] = {
+                    "chat": "小白",
+                    "search": "小白搜索",
+                    "image": "小白生图",
+                    "vision": "小白识图"
+                }
+                self.save_config()
+            
+            # 编译触发词的正则表达式
+            self._compile_trigger_patterns()
+            
             # 注册事件处理器
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
             
@@ -80,18 +93,57 @@ class WenXiaoBaiPlugin(Plugin):
             "device_id": "",
             "conversation_id": "",
             "user_id": "",
-            "web_id": ""
+            "web_id": "",
+            "trigger_words": {
+                "chat": "小白",
+                "search": "小白搜索",
+                "image": "小白生图",
+                "vision": "小白识图"
+            }
         }
+        
+    def _compile_trigger_patterns(self):
+        """根据配置编译触发词的正则表达式"""
+        try:
+            triggers = self.config['trigger_words']
+            # 转义正则表达式特殊字符
+            def escape_regex(text):
+                return re.escape(text)
+                
+            self.chat_pattern = re.compile(f"^{escape_regex(triggers['chat'])}\\s*(.*?)$")
+            self.search_pattern = re.compile(f"^{escape_regex(triggers['search'])}\\s*(.*?)$")
+            self.image_pattern = re.compile(f"^{escape_regex(triggers['image'])}\\s*(.*?)(?:-([^-]+))?(?:-(\\d+:\\d+))?$")
+            self.vision_pattern = re.compile(f"^{escape_regex(triggers['vision'])}\\s*(.*?)$")
+            
+            logger.info(f"[WenXiaoBai] 已更新触发词正则表达式")
+        except Exception as e:
+            logger.error(f"[WenXiaoBai] 编译触发词正则表达式失败: {e}")
+            # 使用默认值
+            self.chat_pattern = re.compile(r"^小白\s*(.*?)$")
+            self.search_pattern = re.compile(r"^小白搜索\s*(.*?)$")
+            self.image_pattern = re.compile(r"^小白生图\s*(.*?)(?:-([^-]+))?(?:-(\d+:\d+))?$")
+            self.vision_pattern = re.compile(r"^小白识图\s*(.*?)$")
 
     def get_help_text(self, **kwargs):
         """返回插件帮助信息"""
+        triggers = self.config.get('trigger_words', {
+            "chat": "小白",
+            "search": "小白搜索",
+            "image": "小白生图",
+            "vision": "小白识图"
+        })
+        
         help_text = (
-            "问小白插件使用说明：\n"
-            "1. 对话功能：以'小白'开头，例如：\n"
-            "   小白 今天天气怎么样？\n"
-            "2. 搜索功能：以'小白搜索'开头，例如：\n"
-            "   小白搜索 广州天气\n"
-            "3. 首次使用需要登录，会自动提示登录流程\n"
+            f"问小白插件使用说明：\n"
+            f"1. 对话功能：以'{triggers['chat']}'开头，例如：\n"
+            f"   {triggers['chat']} 今天天气怎么样？\n"
+            f"2. 搜索功能：以'{triggers['search']}'开头，例如：\n"
+            f"   {triggers['search']} 广州天气\n"
+            f"3. 生图功能：以'{triggers['image']}'开头，例如：\n"
+            f"   {triggers['image']} 一只可爱的猫-动漫风格-16:9\n"
+            f"4. 识图功能：以'{triggers['vision']}'开头，例如：\n"
+            f"   {triggers['vision']} 这张图片是什么内容\n"
+            f"5. 首次使用需要登录，会自动提示登录流程\n"
         )
         return help_text
 
@@ -105,6 +157,24 @@ class WenXiaoBaiPlugin(Plugin):
         
         # 获取用户ID
         user_id = getattr(msg, "from_user_id", None) or getattr(msg, "other_user_id", None)
+        
+        # 检查是否是触发词重载命令
+        if content == "重载问小白触发词" or content == "reload_wenxb_triggers":
+            try:
+                # 重新加载配置文件
+                new_config = super().load_config()
+                if new_config and 'trigger_words' in new_config:
+                    self.config['trigger_words'] = new_config['trigger_words']
+                    # 重新编译触发词正则表达式
+                    self._compile_trigger_patterns()
+                    e_context["reply"] = Reply(ReplyType.TEXT, "问小白触发词已重新加载")
+                else:
+                    e_context["reply"] = Reply(ReplyType.ERROR, "重载失败：配置文件不存在或格式错误")
+            except Exception as e:
+                logger.error(f"[WenXiaoBai] 重载触发词失败: {e}")
+                e_context["reply"] = Reply(ReplyType.ERROR, f"重载触发词失败: {e}")
+            e_context.action = EventAction.BREAK_PASS
+            return
         
         # 如果在登录状态，优先处理登录流程，不检查其他命令
         if self._login_state:
@@ -125,7 +195,7 @@ class WenXiaoBaiPlugin(Plugin):
                             e_context.action = EventAction.BREAK_PASS
                             return
                         else:
-                            error_msg = sms_response.get('msg', '未知错误')
+                            error_msg = sms_response.get('msg', '未知错误') if sms_response else "发送验证码失败"
                             logger.error(f"[WenXiaoBai] 发送验证码失败: {error_msg}")
                             reply = Reply()
                             reply.type = ReplyType.TEXT
@@ -157,6 +227,9 @@ class WenXiaoBaiPlugin(Plugin):
                         # 登录成功后清除手机号
                         self._phone_number = None
                         self._login_state = None
+                        # 移除可能存在的phone字段，确保不保存手机号
+                        if 'phone' in self.config:
+                            del self.config['phone']
                         self.save_config()
                         reply = Reply()
                         reply.type = ReplyType.TEXT
@@ -231,11 +304,11 @@ class WenXiaoBaiPlugin(Plugin):
             e_context.action = EventAction.BREAK_PASS
             return
             
-        # 检查命令类型
-        chat_match = re.match(r"^小白\s*(.*?)$", content)
-        search_match = re.match(r"^小白搜索\s*(.*?)$", content)
-        image_match = re.match(r"^小白生图\s*(.*?)(?:-([^-]+))?(?:-(\d+:\d+))?$", content)
-        vision_match = re.match(r"^小白识图\s*(.*?)$", content)
+        # 检查命令类型 - 使用编译好的正则表达式
+        chat_match = self.chat_pattern.match(content)
+        search_match = self.search_pattern.match(content)
+        image_match = self.image_pattern.match(content)
+        vision_match = self.vision_pattern.match(content)
         
         if not any([chat_match, search_match, image_match, vision_match]):
             return
@@ -268,7 +341,7 @@ class WenXiaoBaiPlugin(Plugin):
                             e_context.action = EventAction.BREAK_PASS
                             return
                         else:
-                            error_msg = sms_response.get('msg', '未知错误')
+                            error_msg = sms_response.get('msg', '未知错误') if sms_response else "发送验证码失败"
                             logger.error(f"[WenXiaoBai] 发送验证码失败: {error_msg}")
                             reply = Reply()
                             reply.type = ReplyType.TEXT
@@ -300,6 +373,9 @@ class WenXiaoBaiPlugin(Plugin):
                         # 登录成功后清除手机号
                         self._phone_number = None
                         self._login_state = None
+                        # 移除可能存在的phone字段，确保不保存手机号
+                        if 'phone' in self.config:
+                            del self.config['phone']
                         self.save_config()
                         reply = Reply()
                         reply.type = ReplyType.TEXT
@@ -328,7 +404,7 @@ class WenXiaoBaiPlugin(Plugin):
             if vision_match:  # 处理识图命令
                 query = vision_match.group(1).strip()
                 if not query:
-                    e_context["reply"] = Reply(ReplyType.ERROR, "请在命令后输入问题，例如：小白识图 这个热量有多少")
+                    e_context["reply"] = Reply(ReplyType.ERROR, f"请在命令后输入问题，例如：{self.config['trigger_words']['vision']} 这个热量有多少")
                     e_context.action = EventAction.BREAK_PASS
                     return
                 
@@ -412,16 +488,26 @@ class WenXiaoBaiPlugin(Plugin):
             logger.error("[WenXiaoBai] 缺少用户ID，请先登录")
             return False
         
-        url = f"{self.api_client.base_url}/api/v1.0/core/conversations/users/{self.config['user_id']}/bots/200006/conversation"
-        response = self.api_client.post(url, {"visitorId": self.config['device_id']})
-        
-        if response and response.get('code') == 0:
-            self.config['conversation_id'] = response['data']
-            self.save_config()
-            logger.info(f"[WenXiaoBai] 新会话已创建: {self.config['conversation_id']}")
-            return True
-        logger.error(f"[WenXiaoBai] 会话创建失败: {response.get('msg') if response else '未知错误'}")
-        return False
+        try:
+            url = f"{self.api_client.base_url}/api/v1.0/core/conversations/users/{self.config['user_id']}/bots/200006/conversation"
+            payload = {"visitorId": self.config['device_id']}
+            
+            # 使用API客户端发送请求
+            response = self.api_client.post(url, payload)
+            
+            if response and response.get('code') == 0:
+                self.config['conversation_id'] = response['data']
+                self.save_config()
+                logger.info(f"[WenXiaoBai] 新会话已创建: {self.config['conversation_id']}")
+                return True
+                
+            error_msg = response.get('msg', '未知错误') if response else '请求失败'
+            logger.error(f"[WenXiaoBai] 会话创建失败: {error_msg}")
+            return False
+            
+        except Exception as e:
+            logger.error(f"[WenXiaoBai] 会话创建失败: {str(e)}")
+            return False
 
     def _process_response(self, response):
         """处理流式响应"""
