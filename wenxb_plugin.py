@@ -513,48 +513,68 @@ class WenXiaoBaiPlugin(Plugin):
         """处理流式响应"""
         full_response = []
         thinking_time = ""
-        last_index = -1
-        response_started = False
-        
+        inside_thinking_block = False
+        event_type = ""
+
         for line in response.iter_lines():
-            if line:
-                decoded_line = line.decode('utf-8')
-                if decoded_line.startswith('data:'):
-                    try:
-                        data = json.loads(decoded_line[5:])
-                        if 'content' in data:
-                            content = str(data['content'])
-                            # 清理引用链接
-                            content = self.ref_pattern.sub('', content)
-                            content_index = data.get('contentIndex', 0)
-                            
-                            if not thinking_time and '已深度思考（用时' in content:
-                                match = re.search(r'已深度思考（用时(.*?)）', content)
-                                if match:
-                                    thinking_time = match.group(1)
-                                    response_started = True
-                                    continue
-                            
-                            if '```' in content or '<' in content or '>' in content:
-                                continue
-                            
-                            if response_started and content_index > last_index:
-                                full_response.append((content_index, content))
-                                last_index = content_index
-                                
-                    except (json.JSONDecodeError, KeyError) as e:
-                        logger.error(f"[WenXiaoBai] 响应解析错误: {str(e)}")
+            if not line:
+                continue
+
+            decoded_line = line.decode('utf-8')
+
+            if decoded_line.startswith('event:'):
+                event_type = decoded_line[len('event:'):].strip()
+                continue
+
+            if decoded_line.startswith('data:'):
+                try:
+                    data_str = decoded_line[len('data:'):]
+                    if not data_str.strip():
+                        continue
+                    data = json.loads(data_str)
+                    content = data.get('content')
+
+                    if content is None:
                         continue
 
-        full_response.sort(key=lambda x: x[0])
-        final_response = ''.join(content for _, content in full_response)
-        
-        # 最后再次清理所有引用标记
-        final_response = self.ref_pattern.sub('', final_response).strip()
-        if thinking_time:
+                    content = str(content)
+
+                    if event_type == "message":
+                        if "```ys_think" in content:
+                            inside_thinking_block = True
+                            continue
+
+                        if "<end>" in content and inside_thinking_block:
+                            inside_thinking_block = False
+                            match = re.search(r'已深度思考（用时(.*?)）', content)
+                            if match:
+                                thinking_time = match.group(1)
+                            continue
+
+                        if inside_thinking_block:
+                            continue
+
+                        cleaned_content = self.ref_pattern.sub('', content)
+                        if cleaned_content.strip():
+                            full_response.append(cleaned_content)
+
+                    elif event_type == "onlineSearch":
+                        pass
+
+                except json.JSONDecodeError:
+                    logger.warning(f"[WenXiaoBai] Skipping invalid JSON data: {decoded_line}")
+                    continue
+                except Exception as e:
+                    logger.error(f"[WenXiaoBai] Error processing stream line: {decoded_line}, Error: {e}")
+                    continue
+
+        final_response = ''.join(full_response).strip()
+        final_response = self.ref_pattern.sub('', final_response).lstrip('\n')
+
+        if thinking_time and not final_response.startswith(f"已深度思考（用时{thinking_time}）"):
             final_response = f"已深度思考（用时{thinking_time}）\n{final_response}"
-        
-        return final_response if final_response else "收到空响应"
+
+        return final_response if final_response else "未能提取到有效响应"
 
     def chat(self, query, use_search=False):
         """发送聊天请求"""
@@ -934,4 +954,4 @@ class WenXiaoBaiPlugin(Plugin):
             
         except Exception as e:
             logger.error(f"[WenXiaoBai] 上传图片失败: {e}")
-            return None 
+            return None
